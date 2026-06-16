@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<script>
+(function() {
+  if (window.location.hash && (window.location.hash.indexOf('access_token=') !== -1 || window.location.hash.indexOf('error=') !== -1)) {
+    var logEl;
+    try {
+      var msgType = window.location.hash.indexOf('access_token=') !== -1 ? 'msal_redirect' : 'msal_redirect_error';
+      var ch = new BroadcastChannel('msal_test_channel');
+      ch.postMessage({ type: msgType, hash: window.location.hash });
+      document.write('<body style="font-family:sans-serif;text-align:center;padding-top:60px;color:#333">' +
+        '<h2>Message envoye via BroadcastChannel</h2>' +
+        '<p>Type: ' + msgType + '</p>' +
+        '<p>Cette fenetre va se fermer dans 3 secondes (laisse le temps de lire)...</p>' +
+        '</body>');
+      document.close();
+    } catch(e) {
+      try {
+        document.write('<body style="font-family:sans-serif;padding:40px;color:red"><h2>ERREUR JS</h2><pre>' + e.message + '</pre></body>');
+        document.close();
+      } catch(e2) {}
+    }
+    setTimeout(function() { window.close(); }, 3000);
+  }
+})();
+</script>
+<meta charset="UTF-8"/>
+<title>Test Auth SharePoint</title>
+</head>
+<body style="font-family:sans-serif; padding:40px; max-width:700px; margin:0 auto;">
+
+<h1>Test minimal : connexion Microsoft + ecriture SharePoint</h1>
+<p>Ce fichier isole uniquement la logique d'authentification, sans le reste de l'outil audit/consultation.</p>
+
+<button id="btnTest" style="font-size:16px; padding:12px 24px; background:#0d0d0d; color:#f0c040; border:none; border-radius:8px; cursor:pointer;">
+  Tester la connexion + ecriture SharePoint
+</button>
+
+<div id="log" style="margin-top:30px; padding:20px; background:#f5f5f5; border-radius:8px; font-family:monospace; font-size:13px; white-space:pre-wrap; min-height:100px;">En attente du test...</div>
+
+<script>
+var MSAL_CLIENT_ID = '86203846-907b-4ac6-819d-a3d4f19636c1';
+var MSAL_TENANT_ID = 'e38080fb-0949-4921-a6fa-425777d70a3f';
+var MSAL_SCOPES = ['Sites.ReadWrite.All', 'Files.ReadWrite.All'];
+var SP_SITE_HOSTNAME = 'brancheconsulting.sharepoint.com';
+var SP_SITE_PATH = '/sites/BranchAuditConsultation';
+
+function log(msg) {
+  var el = document.getElementById('log');
+  var time = new Date().toLocaleTimeString('fr-FR');
+  el.textContent += '\n[' + time + '] ' + msg;
+  console.log('[TEST]', msg);
+}
+
+function buildMsalAuthUrl() {
+  var redirectUri = window.location.origin + window.location.pathname;
+  return 'https://login.microsoftonline.com/' + MSAL_TENANT_ID + '/oauth2/v2.0/authorize' +
+    '?client_id=' + MSAL_CLIENT_ID +
+    '&response_type=token' +
+    '&redirect_uri=' + encodeURIComponent(redirectUri) +
+    '&scope=' + encodeURIComponent(MSAL_SCOPES.join(' ')) +
+    '&response_mode=fragment' +
+    '&nonce=' + Math.random().toString(36).substring(2) +
+    '&prompt=select_account';
+}
+
+function msalLogin() {
+  return new Promise(function(resolve, reject) {
+    var authUrl = buildMsalAuthUrl();
+    log('Ouverture popup avec URL: ' + authUrl.substring(0, 80) + '...');
+    var popup = window.open(authUrl, 'msalPopup', 'width=500,height=600,left=200,top=100');
+    if (!popup) {
+      log('ERREUR: popup est null (bloquee ?)');
+      reject(new Error('Popup bloquee'));
+      return;
+    }
+    log('Popup ouverte avec succes, popup.closed = ' + popup.closed);
+
+    var settled = false;
+    var channel = new BroadcastChannel('msal_test_channel');
+    log('BroadcastChannel cree, en attente de message...');
+
+    function finish(err, token) {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      try { channel.close(); } catch(e) {}
+      try { if (popup && !popup.closed) popup.close(); } catch(e) {}
+      if (err) { reject(err); return; }
+      resolve(token);
+    }
+
+    channel.onmessage = function(ev) {
+      log('Message recu via BroadcastChannel: ' + JSON.stringify(ev.data).substring(0, 100));
+      if (!ev.data || (ev.data.type !== 'msal_redirect' && ev.data.type !== 'msal_redirect_error')) {
+        log('Message ignore (type non reconnu)');
+        return;
+      }
+      if (ev.data.type === 'msal_redirect_error') {
+        finish(new Error('Erreur auth: ' + ev.data.hash));
+        return;
+      }
+      var hash = ev.data.hash;
+      var params = {};
+      hash.substring(1).split('&').forEach(function(p) {
+        var kv = p.split('=');
+        params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || '');
+      });
+      log('Token extrait avec succes (longueur: ' + (params.access_token || '').length + ')');
+      finish(null, params.access_token);
+    };
+
+    var checkCount = 0;
+    var timer = setInterval(function() {
+      checkCount++;
+      if (settled) { clearInterval(timer); return; }
+      try {
+        if (popup.closed) {
+          log('Popup fermee (detectee au check #' + checkCount + ') sans message recu au prealable -> Connexion annulee');
+          finish(new Error('Connexion annulee'));
+          return;
+        }
+      } catch(e) {
+        log('Erreur en verifiant popup.closed: ' + e.message);
+      }
+    }, 500);
+
+    setTimeout(function() {
+      log('Timeout 60s atteint');
+      finish(new Error('Delai depasse'));
+    }, 60000);
+  });
+}
+
+async function getSiteId(token) {
+  log('Resolution du site SharePoint...');
+  var url = 'https://graph.microsoft.com/v1.0/sites/' + SP_SITE_HOSTNAME + ':' + SP_SITE_PATH;
+  var resp = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
+  log('Reponse getSiteId: status ' + resp.status);
+  if (!resp.ok) {
+    var errText = await resp.text();
+    throw new Error('Site introuvable (status ' + resp.status + '): ' + errText.substring(0, 200));
+  }
+  var data = await resp.json();
+  log('Site trouve, ID: ' + data.id);
+  return data.id;
+}
+
+async function writeTestFile(token, siteId) {
+  log('Ecriture du fichier test...');
+  var content = 'Test depuis index.html - ' + new Date().toISOString();
+  var url = 'https://graph.microsoft.com/v1.0/sites/' + siteId + '/drive/root:/test_connexion.txt:/content';
+  var resp = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'text/plain' },
+    body: content
+  });
+  log('Reponse ecriture fichier: status ' + resp.status);
+  if (!resp.ok) {
+    var errText = await resp.text();
+    throw new Error('Erreur ecriture (status ' + resp.status + '): ' + errText.substring(0, 300));
+  }
+  var data = await resp.json();
+  log('SUCCES: fichier ecrit -> ' + data.webUrl);
+  return data;
+}
+
+document.getElementById('btnTest').addEventListener('click', async function() {
+  document.getElementById('log').textContent = '';
+  log('Clic detecte, demarrage du test...');
+  try {
+    var token = await msalLogin();
+    log('Connexion Microsoft reussie !');
+    var siteId = await getSiteId(token);
+    await writeTestFile(token, siteId);
+    log('TEST TERMINE AVEC SUCCES');
+  } catch(e) {
+    log('ECHEC: ' + e.message);
+  }
+});
+</script>
+</body>
+</html>
